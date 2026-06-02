@@ -1,4 +1,4 @@
-cd "c:\Users\dell\Downloads\Internships & Placements\Interview_ShowCase\blogProjectAuthentication\AuthProj\backend"
-python -m venv .venv
-.\.venv\Scripts\activate
-pip install -r requirements.txt
+If in linux
+python -m venv venv
+source venv/bin/activate
+python app.py
