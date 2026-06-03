@@ -31,7 +31,9 @@ def login():
     password = data.get('password')
     try:        # Call the Anvil server function for authentication
         # Instead of using anvil.users.check_password directly
+        print("FLASK: before authenticate_user", flush=True)
         anvil_response = anvil.server.call('authenticate_user', email, password)
+        print("FLASK: after authenticate_user", anvil_response, flush=True)
         
         # Check if Anvil call was successful
         if not anvil_response.get('success'):
