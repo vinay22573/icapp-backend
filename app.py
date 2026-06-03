@@ -2,28 +2,28 @@ from flask import Flask
 from flask_cors import CORS
 import anvil.server
 import os
+import sys
 from dotenv import load_dotenv
 from config import Config
 from utils.auth_utils import init_auth
 
 def create_app():
+
     app = Flask(__name__)
-    CORS(app) # this allows all domains
+    CORS(app)
     # CORS(app,origins=["http://localhost:5173","productionFrontendSite-Deployed.com"]) # for restrictive permissible domains
-    
-    # Load configuration
     app.config.from_object(Config)
-    
-    # Initialize Anvil connection
     load_dotenv()
     ANVIL_KEY = os.getenv('ANVIL_UPLINK_KEY')
     if not ANVIL_KEY:
         raise ValueError("ANVIL_UPLINK_KEY environment variable is required")
-    anvil.server.connect(ANVIL_KEY)
-    
-    # Initialize auth with sessions store
+
+    # import sys
+    if 'gunicorn' not in sys.modules:
+        anvil.server.connect(ANVIL_KEY)
+
     init_auth(app.config['SESSIONS'])
-    
+
     # Register blueprints
     from blueprints.auth import auth_bp
     from blueprints.projects import projects_bp
