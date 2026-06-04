@@ -6,7 +6,8 @@ import sys
 class CurlTester:
     def __init__(self):
         self.token = None
-        self.base_url = "http://localhost:5000"
+        self.base_url = "https://icapp-backend.onrender.com"
+        # self.base_url = "http://localhost:5000"  # Use this for local testing
         
     def check_login(self):
         """Login and get token"""

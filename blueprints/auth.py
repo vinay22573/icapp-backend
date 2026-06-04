@@ -6,9 +6,11 @@ import time
 from functools import wraps
 from datetime import datetime, timedelta
 import bcrypt
+import base64
 import os
 from dotenv import load_dotenv
-from utils.auth_utils import token_required, generate_token, verify_password
+from utils.auth_utils import token_required, generate_token, verify_password, hash_password
+from utils.anvil_executor import call_anvil
 from config import config
 import threading
 from utils.rate_limiter import rate_limit
@@ -21,6 +23,169 @@ auth_bp = Blueprint('auth', __name__)
 # Get SESSION_DURATION from config
 SESSION_DURATION = config.SESSION_DURATION
 
+
+# ─────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────
+
+def _is_valid_email(email):
+    return isinstance(email, str) and "@" in email and "." in email.rsplit("@", 1)[-1]
+
+ 
+# ─────────────────────────────────────────────
+# MEDIA HELPERS — comment out the next block to
+# disable logo upload entirely; rest still works
+# ─────────────────────────────────────────────
+
+
+def _encode_logo_from_request():
+    """
+    Read logo file from multipart request and return (b64_string, content_type).
+    Returns (None, None) if no file present or on any error.
+    This function is the ONLY place that touches logo/media logic on Flask side.
+    """
+    try:
+        logo_file = request.files.get('logo')
+        if not logo_file:
+            return None, None
+        logo_bytes = logo_file.read()
+        if not logo_bytes:
+            return None, None
+        logo_b64 = base64.b64encode(logo_bytes).decode('utf-8')
+        return logo_b64, logo_file.content_type
+    except Exception as e:
+        print(f"[MEDIA] Logo encode error: {e}")
+        return None, None
+# ─────────────────────────────────────────────
+# END MEDIA HELPERS
+# ─────────────────────────────────────────────
+
+
+
+@auth_bp.route('/signup', methods=['POST'])
+def signup():
+    """
+    Sponsor registration endpoint.
+    Accepts multipart/form-data (because of logo file upload).
+    Falls back to JSON if no file is present.
+ 
+    Flow:
+        1. Validate all fields
+        2. RPC1 — register_user (create user row in Anvil)
+        3. [MEDIA] Try to encode logo — non-fatal if it fails
+        4. RPC2 — register_sponsor (create sponsor row + update user row)
+        5. If RPC2 fails → cleanup: delete user row via delete_user_by_email
+        6. Return success + optional media_warning if logo upload failed
+    """
+ 
+    # Support both multipart (with file) and JSON (without file)
+    is_multipart = bool(request.content_type and 'multipart/form-data' in request.content_type)
+    if is_multipart:
+        data = request.form
+        get = lambda key, default="": data.get(key, default)
+        import json
+        try:
+            industries = json.loads(get('industries', '[]'))
+            if not isinstance(industries, list):
+                industries = []
+        except Exception:
+            industries = []
+    else:
+        data = request.get_json() or {}
+        get = lambda key, default="": data.get(key, default)
+        industries = data.get('industries', [])
+        if not isinstance(industries, list):
+            industries = []
+ 
+    # ── Extract fields ──
+    email        = get('email').strip().lower()
+    password     = get('password').strip()
+    rep_name     = get('name').strip()
+    role         = get('role', 'primary_representative').strip()
+    sponsor_name = get('sponsor_name').strip()
+    display_name = get('display_name').strip()
+    website      = get('website').strip()
+    description  = get('description', '').strip()
+ 
+    # ── Validate ──
+    if not email or not password or not rep_name:
+        return jsonify({"error": "Name, email and password are required"}), 400
+    if not _is_valid_email(email):
+        return jsonify({"error": "Invalid email address"}), 400
+    if len(password) < 8:
+        return jsonify({"error": "Password must be at least 8 characters"}), 400
+    if not sponsor_name or not display_name or not website:
+        return jsonify({"error": "Sponsor name, display name and website are required"}), 400
+ 
+    # ── Step 1: Register user ──
+    try:
+        password_hash = hash_password(password)
+        rpc1 = call_anvil("register_user", email, password_hash)
+        if not rpc1.get("success"):
+            error_msg = rpc1.get("error", "Registration failed")
+            status_code = 409 if "already" in error_msg.lower() else 400
+            return jsonify({"error": error_msg}), status_code
+    except Exception as e:
+        print(f"[SIGNUP] RPC1 register_user failed: {e}")
+        return jsonify({"error": f"User registration failed: {str(e)}"}), 500
+ 
+    # ── [MEDIA] Step 2: Try to encode logo — non-fatal ──
+    # To disable logo upload entirely: comment out the next 3 lines
+    # and set logo_b64 = None, logo_content_type = None manually.
+    logo_was_provided = bool(is_multipart and request.files.get('logo'))
+    logo_b64, logo_content_type = _encode_logo_from_request()
+    media_warning = None
+    if logo_was_provided and logo_b64 is None:
+        media_warning = "Logo could not be processed. Account created successfully — please upload the logo manually via the Anvil dashboard."
+    # ── END MEDIA STEP ──
+ 
+    # ── Step 3: Register sponsor (sequential — depends on user existing) ──
+    try:
+        sponsor_payload = {
+            "name":         sponsor_name,
+            "display_name": display_name,
+            "website":      website,
+            "description":  description,
+            "industries":   industries,
+            "rep_name":     rep_name,
+            "role":         role,
+            # ── MEDIA FIELDS — comment these two lines to disable logo in RPC ──
+            "logo_b64":           logo_b64,
+            "logo_content_type":  logo_content_type,
+            # ── END MEDIA FIELDS ──
+        }
+        rpc2 = call_anvil("register_sponsor", email, sponsor_payload)
+ 
+        if not rpc2.get("success"):
+            # Atomic cleanup — user row must be removed if sponsor step failed
+            try:
+                call_anvil("delete_user_by_email", email)
+            except Exception as cleanup_err:
+                print(f"[SIGNUP] Cleanup RPC failed: {cleanup_err}")
+            return jsonify({"error": rpc2.get("error", "Sponsor registration failed")}), 400
+ 
+    except Exception as e:
+        print(f"[SIGNUP] RPC2 register_sponsor failed: {e}")
+        # Atomic cleanup
+        try:
+            call_anvil("delete_user_by_email", email)
+        except Exception as cleanup_err:
+            print(f"[SIGNUP] Cleanup RPC failed: {cleanup_err}")
+        return jsonify({"error": f"Sponsor registration failed: {str(e)}"}), 500
+ 
+    # ── Success ──
+    response_body = {
+        "success": True,
+        "message": "Account created successfully. Pending admin verification before you can log in.",
+    }
+    if media_warning:
+        response_body["media_warning"] = media_warning
+ 
+    return jsonify(response_body), 201
+ 
+ 
+
+
 @auth_bp.route('/login', methods=['POST'])
 @rate_limit(limit=5, period=3600, key_func=lambda: ((request.get_json(silent=True) or {}).get('email') or request.remote_addr or "unknown").lower())
 def login():
@@ -31,9 +196,10 @@ def login():
     password = data.get('password')
     try:        # Call the Anvil server function for authentication
         # Instead of using anvil.users.check_password directly
-        print("FLASK: before authenticate_user", flush=True)
-        anvil_response = anvil.server.call('authenticate_user', email, password)
-        print("FLASK: after authenticate_user", anvil_response, flush=True)
+        # print("FLASK: before authenticate_user", flush=True)
+        # anvil_response = anvil.server.call('authenticate_user', email, password)
+        anvil_response = call_anvil("authenticate_user", email, password)
+        # print("FLASK: after authenticate_user", anvil_response, flush=True)
         
         # Check if Anvil call was successful
         if not anvil_response.get('success'):
@@ -75,7 +241,7 @@ def login():
     except Exception as e:
         print(f"Login error: {str(e)}")
         return jsonify({"error": f"Authentication Failed: {str(e)}"}), 500
-    
+
 
 @auth_bp.route('/logout', methods=['POST'])
 @token_required

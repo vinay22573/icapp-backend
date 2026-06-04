@@ -20,6 +20,25 @@ def init_auth(sessions_store):
 def generate_token():
     return secrets.token_hex(32)
 
+
+def generate_token():
+    return secrets.token_hex(32)
+
+def hash_password(plain_password):
+    """Hash password using bcrypt before storing it outside Flask."""
+    password_bytes = plain_password.encode("utf-8")
+    return bcrypt.hashpw(password_bytes, bcrypt.gensalt()).decode("utf-8")
+
+def verify_password(plain_password, hashed_password):
+    """Verify password using bcrypt"""
+    try:
+        password_bytes = plain_password.encode('utf-8')
+        hash_bytes = hashed_password.encode('utf-8')
+        return bcrypt.checkpw(password_bytes, hash_bytes)
+    except Exception as e:
+        print(f"Flask bcrypt error: {e}")
+        return False
+
 def verify_password(plain_password, hashed_password):
     """Verify password using bcrypt"""
     try:
